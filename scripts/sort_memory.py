@@ -46,6 +46,11 @@ import zstandard
 LOG_NAME_VERSIONS = (("session.v4.jsonl.zstd", 4), ("session.jsonl.zstd", 0))
 USER_LABEL = "对方"
 ROLE_LABEL = "角色"
+# 单个待整理文件的大小上限。dsh 的 read 工具一次最多给 51200 字节，这里留出余量，
+# 免得文件正好卡在线上，最后几行被静默截掉。
+DEFAULT_CHUNK_BYTES = 40000
+# 每块开头那几行元信息大概占多少字节，估算块大小时先扣掉
+CHUNK_HEADER_RESERVE = 1024
 # 整理会话自己的对话不进记忆，否则下一次整理要把上一次整理时说过的话再读一遍
 DEFAULT_SKIP_TITLE_PREFIX = "📦 记忆整理"
 
@@ -329,35 +334,115 @@ def write_cursor(path, cursor):
     print(f"\n[游标] 已更新: {path}（{len(cursor)} 个会话）")
 
 
-def write_pending_file(pending_dir, session_id, messages, header, preset, user_label=USER_LABEL, role_label=ROLE_LABEL):
+def _encoded_len(text):
+    return len(text.encode("utf-8"))
+
+
+def split_messages(messages, part_bytes, user_label, role_label):
+    """
+    按消息边界把对话切成若干块，每块正文的估算体积不超过 part_bytes。
+
+    切点只落在两条消息之间，一条消息不会被拆成两半，所以每一块读下来都是完整的发言。
+    单条消息本身就超过上限时，它自己占一块，剩下的话下一块再起。
+    返回的每一项是 [(seq, ts, role, text), ...]。
+    """
+    budget = max(part_bytes - CHUNK_HEADER_RESERVE, 1024)
+    parts = []
+    current = []
+    current_size = 0
+    for seq, ts, role, text in messages:
+        who = user_label if role == "user" else role_label
+        size = _encoded_len(f"### [{ts_to_str(ts)}] {who}\n{text}\n\n")
+        if current and current_size + size > budget:
+            parts.append(current)
+            current = []
+            current_size = 0
+        current.append((seq, ts, role, text))
+        current_size += size
+    if current:
+        parts.append(current)
+    return parts
+
+
+def write_pending_file(pending_dir, session_id, messages, header, preset, user_label=USER_LABEL,
+                       role_label=ROLE_LABEL, part_bytes=DEFAULT_CHUNK_BYTES):
+    """
+    把一次提取出来的对话写进待整理目录。
+
+    超过 part_bytes 就按消息边界切成多块，文件名带序号：
+    <会话id>.md（只有一块时），或者 <会话id>_1of3.md、<会话id>_2of3.md ……
+    每块开头写明这是第几块、共几块、上一块和下一块叫什么、覆盖哪段时间，
+    最后一块之外还会在末尾再提一句后面还有几块，省得读到一半以为读完了。
+    """
     if not messages:
         return False
 
     ensure_dir(pending_dir)
-    filepath = os.path.join(pending_dir, f"{session_id}.md")
+
+    parts = split_messages(messages, part_bytes, user_label, role_label)
+    total_parts = len(parts)
 
     user_count = sum(1 for m in messages if m[2] == "user")
     role_count = sum(1 for m in messages if m[2] == "assistant")
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(f"# {session_id}\n")
-        f.write(f"创建: {ts_to_str(header.get('createdAt', 0))}\n")
-        f.write(f"目录: {header.get('cwd', '')}\n")
-        f.write(f"模式: {preset}\n")
-        f.write(f"消息数: {len(messages)}（{user_label} {user_count} 条 / {role_label} {role_count} 条）\n")
-        f.write(f"提取时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write("\n---\n\n")
+    def part_name(index):
+        if total_parts == 1:
+            return f"{session_id}.md"
+        return f"{session_id}_{index + 1}of{total_parts}.md"
 
-        for seq, ts, role, text in messages:
-            who = user_label if role == "user" else role_label
-            f.write(f"### [{ts_to_str(ts)}] {who}\n")
-            f.write(f"{text}\n\n")
+    written = []
+    for index, part in enumerate(parts):
+        filepath = os.path.join(pending_dir, part_name(index))
+        part_user = sum(1 for m in part if m[2] == "user")
+        part_role = sum(1 for m in part if m[2] == "assistant")
 
-    size = os.path.getsize(filepath)
-    if size > 51200:
-        print(f"   注意：文件 {size / 1024:.0f}KB，超过 read 工具单次显示上限，可能被截断")
+        with open(filepath, "w", encoding="utf-8") as f:
+            if total_parts == 1:
+                f.write(f"# {session_id}\n")
+            else:
+                # 开头先说清楚这个会话被切开了，读的人一眼就知道后面还有，
+                # 不用等翻到页脚才发觉没读完。
+                f.write(f"# {session_id}\n\n")
+                tail_mark = "，也是最后一个。" if index + 1 == total_parts else "。"
+                f.write(f"> **该会话已做分片处理，这是第 {index + 1} 个分片，共 {total_parts} 个分片{tail_mark}**\n")
+                if index > 0:
+                    f.write(f"> 上一个分片：{part_name(index - 1)}。\n")
+                if index + 1 < total_parts:
+                    f.write(f"> 全部分片按序号读完再开始整理，下一个分片：{part_name(index + 1)}。\n")
+                f.write("\n")
+            f.write(f"创建: {ts_to_str(header.get('createdAt', 0))}\n")
+            f.write(f"目录: {header.get('cwd', '')}\n")
+            f.write(f"模式: {preset}\n")
+            f.write(f"消息数: {len(messages)}（{user_label} {user_count} 条 / {role_label} {role_count} 条）\n")
+            f.write(f"提取时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+            if total_parts > 1:
+                f.write(f"本分片时间范围: {ts_to_str(part[0][1])} ~ {ts_to_str(part[-1][1])}\n")
+                f.write(f"本分片消息数: {len(part)}（{user_label} {part_user} 条 / {role_label} {part_role} 条）\n")
+            f.write("\n---\n\n")
 
-    print(f"  [写入] {filepath}（{len(messages)} 条：{user_label} {user_count} / {role_label} {role_count}）")
+            for seq, ts, role, text in part:
+                who = user_label if role == "user" else role_label
+                f.write(f"### [{ts_to_str(ts)}] {who}\n")
+                f.write(f"{text}\n\n")
+
+            if total_parts > 1 and index + 1 < total_parts:
+                remaining = total_parts - index - 1
+                f.write(f"\n（这个分片到此为止，后面还有 {remaining} 个，接着读 {part_name(index + 1)}）\n")
+
+        size = os.path.getsize(filepath)
+        written.append((part_name(index), size))
+
+        if size > 51200:
+            print(f"   [注意] {part_name(index)} 有 {size / 1024:.0f}KB，仍然超过 read 单次上限")
+            if len(part) == 1:
+                print("          这一条消息本身就超过了分块上限，只能整条放进去")
+            else:
+                print("          这一块已经按消息边界切到最小了，再砍就会把一条发言拆成两半")
+
+    for name, size in written:
+        print(f"  [写入] {name}（{size / 1024:.1f}KB）")
+    tail = f"，切成 {total_parts} 块" if total_parts > 1 else ""
+    print(f"  共 {len(messages)} 条：{user_label} {user_count} / {role_label} {role_count}{tail}")
     return True
 
 
@@ -378,6 +463,9 @@ def main():
                         help="只提取最近这么多天内的对话。第一次跑建议加上，不然会把历史会话全提出来")
     parser.add_argument("--user-label", default=USER_LABEL, help="待整理文件里怎么称呼被整理的那个人，填模板里【称呼】换下来的叫法")
     parser.add_argument("--role-label", default=ROLE_LABEL, help="待整理文件里怎么称呼角色自己，填模板里【角色】换下来的名字")
+    parser.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES,
+                        help=f"单个待整理文件的大小上限（字节），超过就按消息边界切成多块。默认 {DEFAULT_CHUNK_BYTES}，"
+                             "dsh 的 read 工具单次上限是 51200 字节，一般不用改")
     args = parser.parse_args()
 
     workspace = os.path.abspath(args.workspace) if args.workspace else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -486,7 +574,8 @@ def main():
             print(f"  标题: {title}")
         print(f"  模式: {preset}  创建: {ts_to_str(header.get('createdAt'))}")
 
-        ok = write_pending_file(pending_dir, sid, messages, header, preset, args.user_label, args.role_label)
+        ok = write_pending_file(pending_dir, sid, messages, header, preset, args.user_label, args.role_label,
+                                args.chunk_bytes)
         if ok:
             processed += 1
             total_msgs += len(messages)

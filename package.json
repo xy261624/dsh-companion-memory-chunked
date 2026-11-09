@@ -1,7 +1,7 @@
 {
-  "name": "dsh-companion-memory",
+  "name": "dsh-companion-memory-chunked",
   "version": "0.1.1",
-  "description": "DeepSeek Harness 的跨会话记忆与主动唤醒方案，面向角色扮演（RP）、长期陪伴、AI 恋人场景。记忆由角色自己以第一人称整理，带对抗式审查和随机心跳。",
+  "description": "DeepSeek Harness 的跨会话记忆与主动唤醒方案，面向角色扮演（RP）、长期陪伴、AI 恋人场景。记忆由角色自己以第一人称整理，带对抗式审查和随机心跳。分支版把待整理文件按消息边界分块，避免单份超过 read 工具单次读取上限。",
   "type": "module",
   "exports": {
     "./heartbeat": "./plugins/dsh-heartbeat/index.js",
@@ -26,7 +26,8 @@
     "companion",
     "ai-companion",
     "roleplay",
-    "persona"
+    "persona",
+    "chunked"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -48,11 +49,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xy261624/dsh-companion-memory.git"
+    "url": "git+https://github.com/xy261624/dsh-companion-memory-chunked.git"
   },
-  "homepage": "https://github.com/xy261624/dsh-companion-memory#readme",
+  "homepage": "https://github.com/xy261624/dsh-companion-memory-chunked#readme",
   "bugs": {
-    "url": "https://github.com/xy261624/dsh-companion-memory/issues"
+    "url": "https://github.com/xy261624/dsh-companion-memory-chunked/issues"
   },
   "publishConfig": {
     "access": "public"

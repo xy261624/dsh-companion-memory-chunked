@@ -1,18 +1,59 @@
-# dsh-companion-memory
+# dsh-companion-memory（分块版）
 
 DeepSeek Harness 的跨会话记忆与主动唤醒方案，适用于角色扮演与长期陪伴场景。
+
+> 本仓库是 [xy261624/dsh-companion-memory](https://github.com/xy261624/dsh-companion-memory) 的一个分支，改动集中在会话提取脚本：待整理文件按消息边界切成多块，使每一块都落在 dsh `read` 工具的单次读取上限以内。插件与模板与上游一致，文档只在对应位置补充了分块的说明。
+
+## 这个分支针对什么
+
+### 会遇到的场景
+
+长时间在同一会话进行对话，单次提取出的某一份待整理文件较大，以至于超过 read 单次上限的 51200 字节。
+
+dsh 的 `read` 工具单次返回的字节数存在上限（配置项 `readMaxBytes`，默认 51200；另有行数上限 `readLimit`，默认 2000 行）。超出上限时工具不报错，而是在结果末尾追加一行说明：
+
+```
+（输出被截断了。当前显示的是第 1-x 行。想接着往下读就用 offset=x+1。）
+```
+
+能力较强的模型会据此继续读取剩余部分；能力较弱或注意力不足的模型常常忽略这行说明，据此判定文件已读完，后半段对话因此未被读入，整理出的记忆随之缺失内容。外在表现是：会话明明产生了新内容，记忆文件却没有更新。
+
+### 这个分支做了什么
+
+提取脚本在写文件前估算体积，超过阈值即按**消息边界**切成多个分片。阈值由 `--chunk-bytes` 指定，默认 40000 字节。
+
+- 只切出一个分片时文件名不变：`<会话id>.md`
+- 切出多个分片时带序号与总数：`<会话id>_1of3.md`、`<会话id>_2of3.md`、`<会话id>_3of3.md`
+- 每个分片开头先用一行醒目的引用块说明：该会话已做分片处理，这是第几个分片、共几个；另起一行给出上一个分片与下一个分片的名称
+- 分片内另列本分片覆盖的起止时间与双方条数
+- 除最后一个分片外，分片末尾追加一行「后面还有 N 个，接着读 xxx」
+
+切分点只落在两条消息之间，单条发言不会被拆开。若单条消息本身的体积已超过阈值，该条单独成片，并在控制台打印提示。
+
+由此每个分片的体积均在 `read` 单次上限以内，读取方无需依赖页脚提示也不会漏读。
+
+### 使用上的配合
+
+整理流程中「读会话」一步，应改为：同一会话的所有分片按序号依次读完后，再开始整理。文件名中的 `NofM` 即分片序号与总分片数。
+
+### 与上游的关系
+
+- 上游仓库：https://github.com/xy261624/dsh-companion-memory
+- 改动范围：`scripts/sort_memory.py`（分块写入、新增 `--chunk-bytes` 参数、对应的控制台输出），`docs/03-整理流程.md`（读会话一节补充分块说明），本 README 新增本节，`package.json` 的包名与仓库地址。
+- 插件代码与模板未改动。
+- 同步上游更新时，冲突预计只出现在 `write_pending_file`、命令参数解析两处。
 
 ## 快速开始
 
 ```sh
-dsh plugin --profile web add github:xy261624/dsh-companion-memory
+dsh plugin --profile web add github:xy261624/dsh-companion-memory-chunked
 dsh --profile web
 ```
 
 安装包内含挂载声明，安装完成后心跳与自动整理两个插件即完成挂载。此后尚需完成三项配置：
 
 1. 为模式添加一条 `agent-instructions` 声明，将常驻记忆文件列入注入名单。若尚无自定义模式，先按后文「模式配置」一节创建。
-2. 创建工作区目录，将包内的模板与脚本复制到其中。已安装的包位于 `$DSH_HOME\profiles\web\node_modules\dsh-companion-memory\`，`DSH_HOME` 未设置时为 `%USERPROFILE%\.dsh`。各文件的放置位置见[上手](./docs/05-上手.md)第二节的对照表，共七行，须完整执行。模板与整理流程中包含 `【称呼】` 与 `【角色】` 两个占位符，替换方式见后文「两个占位符」。
+2. 创建工作区目录，将包内的模板与脚本复制到其中。已安装的包位于 `$DSH_HOME\profiles\web\node_modules\dsh-companion-memory-chunked\`，`DSH_HOME` 未设置时为 `%USERPROFILE%\.dsh`。各文件的放置位置见[上手](./docs/05-上手.md)第二节的对照表，共七行，须完整执行。模板与整理流程中包含 `【称呼】` 与 `【角色】` 两个占位符，替换方式见后文「两个占位符」。
 3. 将 `defaultPreset` 与 `sortPreset` 改为当前环境中存在的模式 id。两个插件默认写入的 `default` 在 dsh 中并不存在；名称不匹配时会话无法创建，仅在日志中留下一行错误。在 profile 的 `cordis.patch.yml` 末尾添加以下两段：
 
 ```yaml
@@ -210,7 +251,7 @@ dsh 目前处于开发者预览阶段，插件接口会随版本变动。升级�
 ## 安装
 
 ```sh
-dsh plugin --profile web add github:xy261624/dsh-companion-memory
+dsh plugin --profile web add github:xy261624/dsh-companion-memory-chunked
 ```
 
 包内的 `cordis.patch.yml` 会将两个插件自动插入组合。未配置 `workspace` 时使用 dsh 中的第一个工作区；存在多个工作区且需指定其一，在 profile 的 `cordis.patch.yml` 中追加以下内容：
